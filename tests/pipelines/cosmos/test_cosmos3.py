@@ -169,6 +169,75 @@ class TestCosmos3OmniPipeline(Cosmos3OmniPipelineTesterConfig, PipelineTesterMix
             torch.testing.assert_close(sigma, float(pipeline.scheduler.sigmas[expected_step]))
             assert num_steps == pipeline.num_timesteps
 
+    def test_mask_velocity_predictions_avoids_scalar_extraction(self):
+        pred_vision = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+        pred_sound = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+        pred_action = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        vision_mask = torch.tensor([[1, 0, 1], [0, 0, 1]], dtype=torch.float32)
+        sound_mask = torch.tensor([[1, 0], [0, 0], [1, 1]], dtype=torch.float32)
+        action_mask = torch.tensor([[1, 0, 0, 0], [0, 0, 1, 1]], dtype=torch.float32)
+
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+            velocity_vision, velocity_sound, velocity_action = self.pipeline_class._mask_velocity_predictions(
+                preds_vision=[pred_vision],
+                preds_sound=[pred_sound],
+                vision_condition_mask=[vision_mask],
+                sound_condition_mask=[sound_mask],
+                preds_action=[pred_action],
+                action_condition_mask=[action_mask],
+                raw_action_dim=3,
+            )
+            fully_masked_vision, _, _ = self.pipeline_class._mask_velocity_predictions(
+                preds_vision=[torch.full_like(pred_vision, torch.nan)],
+                preds_sound=None,
+                vision_condition_mask=[torch.ones_like(vision_mask)],
+            )
+
+        assert all(event.key != "aten::_local_scalar_dense" for event in profile.key_averages())
+        torch.testing.assert_close(velocity_vision, pred_vision * (1 - vision_mask))
+        torch.testing.assert_close(velocity_sound, pred_sound * (1 - sound_mask).T)
+        expected_action = pred_action * (1 - action_mask)
+        expected_action[:, 3:] = 0
+        torch.testing.assert_close(velocity_action, expected_action)
+        torch.testing.assert_close(fully_masked_vision, torch.zeros_like(pred_vision))
+
+    def test_denoising_avoids_scheduler_search_and_timestep_scalar_roundtrip(self):
+        pipeline = self.pipeline_class(**self.get_dummy_components()).to(torch_device)
+        pipeline.set_progress_bar_config(disable=None)
+        transformer_timesteps = []
+        callback_timesteps = []
+
+        def transformer_forward(**kwargs):
+            vision_tokens = kwargs["vision_tokens"][0]
+            transformer_timesteps.append(kwargs["vision_timesteps"])
+            return ([torch.zeros_like(vision_tokens)], None, None)
+
+        def callback_on_step_end(_pipeline, _step_index, timestep, callback_kwargs):
+            callback_timesteps.append(timestep)
+            return callback_kwargs
+
+        inputs = self.get_dummy_inputs()
+        inputs.update(
+            output_type="latent",
+            enable_safety_check=False,
+            callback_on_step_end=callback_on_step_end,
+        )
+        with (
+            mock.patch.object(
+                pipeline.scheduler,
+                "index_for_timestep",
+                side_effect=AssertionError("The initial scheduler index should be provided by the pipeline"),
+            ),
+            mock.patch.object(pipeline.transformer, "forward", side_effect=transformer_forward),
+        ):
+            pipeline(**inputs)
+
+        assert pipeline.scheduler.begin_index == 0
+        assert len(transformer_timesteps) == len(callback_timesteps) == inputs["num_inference_steps"]
+        for expanded_timestep, scheduler_timestep in zip(transformer_timesteps, callback_timesteps):
+            assert expanded_timestep.untyped_storage().data_ptr() == scheduler_timestep.untyped_storage().data_ptr()
+            torch.testing.assert_close(expanded_timestep, scheduler_timestep.expand_as(expanded_timestep))
+
     def test_cosmos3_tokenize_prompt_uses_checkpoint_system_prompt_default(self):
         components = self.get_dummy_components()
         components["default_use_system_prompt"] = False
