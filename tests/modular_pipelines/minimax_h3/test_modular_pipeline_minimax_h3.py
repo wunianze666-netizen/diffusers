@@ -20,6 +20,7 @@ import pytest
 import safetensors.torch
 import torch
 from PIL import Image
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from diffusers.modular_pipelines import (
     MiniMaxH3Blocks,
@@ -316,14 +317,27 @@ class TestMiniMaxH3ModularPipelineFast(MiniMaxH3ModularPipelineTesterConfig, Mod
         assert torch.equal(outputs[0][1], outputs[1][1])
 
     def test_timestep_setup_avoids_scalar_extraction_and_scheduler_search(self):
+        class ScalarExtractionCounter(TorchDispatchMode):
+            def __init__(self):
+                super().__init__()
+                self.count = 0
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func is torch.ops.aten._local_scalar_dense.default:
+                    self.count += 1
+                return func(*args, **(kwargs or {}))
+
         block = MiniMaxH3SetTimestepsStep()
         pipe = block.init_pipeline()
         pipe.update_components(scheduler=MiniMaxH3Scheduler(shift=12.0), audio_scheduler=MiniMaxH3Scheduler(shift=3.0))
         text_indices = torch.arange(0, 2)
         audio_indices = torch.arange(2, 5)
         video_indices = torch.arange(5, 9)
+        sample = torch.ones(1)
+        model_output = torch.zeros_like(sample)
 
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+        scalar_extractions = ScalarExtractionCounter()
+        with scalar_extractions:
             state = pipe(
                 num_inference_steps=4,
                 text_indices=text_indices,
@@ -333,11 +347,10 @@ class TestMiniMaxH3ModularPipelineFast(MiniMaxH3ModularPipelineTesterConfig, Mod
                 num_condition_video_rows=1,
                 output=["timesteps", "audio_timesteps", "row_timestep_plan"],
             )
+            pipe.scheduler.step(model_output, state["timesteps"][0], sample)
+            pipe.audio_scheduler.step(model_output, state["audio_timesteps"][0], sample)
 
-        scalar_extractions = sum(
-            event.count for event in profile.key_averages() if event.key == "aten::_local_scalar_dense"
-        )
-        assert scalar_extractions == 0
+        assert scalar_extractions.count == 0
         assert pipe.scheduler.begin_index == 0
         assert pipe.audio_scheduler.begin_index == 0
 
@@ -353,16 +366,6 @@ class TestMiniMaxH3ModularPipelineFast(MiniMaxH3ModularPipelineTesterConfig, Mod
             torch.testing.assert_close(
                 timestep_table.index_select(0, timestep_indices), expected_row_timesteps, rtol=0, atol=0
             )
-
-        def fail_index_search(_):
-            raise AssertionError("The pipeline always begins at schedule index zero; no timestep search is needed.")
-
-        pipe.scheduler.index_for_timestep = fail_index_search
-        pipe.audio_scheduler.index_for_timestep = fail_index_search
-        sample = torch.ones(1)
-        model_output = torch.zeros_like(sample)
-        pipe.scheduler.step(model_output, state["timesteps"][0], sample)
-        pipe.audio_scheduler.step(model_output, state["audio_timesteps"][0], sample)
 
     @pytest.mark.parametrize("with_keyframes", [False, True], ids=["t2va", "fl2va"])
     def test_text_encoder_block_standalone(self, with_keyframes):

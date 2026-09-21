@@ -80,7 +80,7 @@ class MiniMaxH3LoopDenoiser(ModularPipelineBlocks):
                 name="row_timestep_plan",
                 type_hint=list,
                 required=True,
-                description="One `(timestep, timestep_indices)` pair per step.",
+                description="One `(timestep_table, timestep_indices)` pair per step.",
             ),
             InputParam(
                 kwargs_type="denoiser_input_fields",
@@ -110,7 +110,7 @@ class MiniMaxH3LoopDenoiser(ModularPipelineBlocks):
     @torch.no_grad()
     def __call__(self, components: MiniMaxH3ModularPipeline, block_state: BlockState, i: int, t: torch.Tensor):
         transformer = getattr(components, self.transformer_name)
-        unique_timesteps, timestep_indices = block_state.row_timestep_plan[i]
+        timestep_table, timestep_indices = block_state.row_timestep_plan[i]
         # The layout tags its outputs `denoiser_input_fields`, and their names are the transformer's own parameter
         # names, so the rows of the packed sequence are described to it without this block enumerating them.
         layout_kwargs = {
@@ -122,7 +122,7 @@ class MiniMaxH3LoopDenoiser(ModularPipelineBlocks):
             hidden_states=block_state.latents[None],
             audio_hidden_states=block_state.audio_latents[None],
             encoder_hidden_states=block_state.prompt_embeds,
-            timestep=unique_timesteps,
+            timestep=timestep_table,
             timestep_indices=timestep_indices,
             attention_kwargs=block_state.attention_kwargs,
             return_dict=False,
