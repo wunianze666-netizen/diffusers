@@ -30,6 +30,7 @@ from diffusers.modular_pipelines.minimax_h3 import (
     MiniMaxH3ImageReference,
     MiniMaxH3VideoReference,
 )
+from diffusers.modular_pipelines.minimax_h3.before_denoise import MiniMaxH3SetTimestepsStep
 from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3Ref2VASetupStep
 from diffusers.modular_pipelines.minimax_h3.encoders import (
     MiniMaxH3FL2VATextEncoderStep,
@@ -38,6 +39,7 @@ from diffusers.modular_pipelines.minimax_h3.encoders import (
     MiniMaxH3TextEncoderStep,
 )
 from diffusers.modular_pipelines.minimax_h3.modular_pipeline import MINIMAX_H3_FPS
+from diffusers.schedulers import MiniMaxH3Scheduler
 from diffusers.utils import is_peft_available, logging
 
 from ...testing_utils import CaptureLogger
@@ -312,6 +314,55 @@ class TestMiniMaxH3ModularPipelineFast(MiniMaxH3ModularPipelineTesterConfig, Mod
 
         assert torch.equal(outputs[0][0], outputs[1][0])
         assert torch.equal(outputs[0][1], outputs[1][1])
+
+    def test_timestep_setup_avoids_scalar_extraction_and_scheduler_search(self):
+        block = MiniMaxH3SetTimestepsStep()
+        pipe = block.init_pipeline()
+        pipe.update_components(scheduler=MiniMaxH3Scheduler(shift=12.0), audio_scheduler=MiniMaxH3Scheduler(shift=3.0))
+        text_indices = torch.arange(0, 2)
+        audio_indices = torch.arange(2, 5)
+        video_indices = torch.arange(5, 9)
+
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+            state = pipe(
+                num_inference_steps=4,
+                text_indices=text_indices,
+                audio_indices=audio_indices,
+                video_indices=video_indices,
+                num_condition_audio_rows=1,
+                num_condition_video_rows=1,
+                output=["timesteps", "audio_timesteps", "row_timestep_plan"],
+            )
+
+        scalar_extractions = sum(
+            event.count for event in profile.key_averages() if event.key == "aten::_local_scalar_dense"
+        )
+        assert scalar_extractions == 0
+        assert pipe.scheduler.begin_index == 0
+        assert pipe.audio_scheduler.begin_index == 0
+
+        for video_timestep, audio_timestep, (timestep_table, timestep_indices) in zip(
+            state["timesteps"], state["audio_timesteps"], state["row_timestep_plan"]
+        ):
+            expected_row_timesteps = video_timestep.expand(9).clone()
+            expected_row_timesteps[video_indices[:1]] = torch.maximum(
+                video_timestep, video_timestep.new_tensor(pipe.keyframe_noise_aug)
+            )
+            expected_row_timesteps[audio_indices[1:]] = audio_timestep
+            expected_row_timesteps[audio_indices[:1]] = 1.0
+            torch.testing.assert_close(
+                timestep_table.index_select(0, timestep_indices), expected_row_timesteps, rtol=0, atol=0
+            )
+
+        def fail_index_search(_):
+            raise AssertionError("The pipeline always begins at schedule index zero; no timestep search is needed.")
+
+        pipe.scheduler.index_for_timestep = fail_index_search
+        pipe.audio_scheduler.index_for_timestep = fail_index_search
+        sample = torch.ones(1)
+        model_output = torch.zeros_like(sample)
+        pipe.scheduler.step(model_output, state["timesteps"][0], sample)
+        pipe.audio_scheduler.step(model_output, state["audio_timesteps"][0], sample)
 
     @pytest.mark.parametrize("with_keyframes", [False, True], ids=["t2va", "fl2va"])
     def test_text_encoder_block_standalone(self, with_keyframes):

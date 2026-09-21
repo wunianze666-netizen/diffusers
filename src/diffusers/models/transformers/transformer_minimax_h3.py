@@ -584,8 +584,8 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin, PeftA
             encoder_hidden_states (`torch.Tensor` of shape `(batch_size, num_text_tokens, text_dim)`):
                 Text conditioning, ordered to match `text_indices`.
             timestep (`torch.Tensor` of shape `(num_timesteps,)`):
-                The *distinct* timestep values present in the packed sequence, in `[0, 1]` and unscaled. One forward
-                serves rows at different noise levels (target video, target audio, conditioning rows).
+                The timestep table for the packed sequence, in `[0, 1]` and unscaled. One forward serves rows at
+                different noise levels (target video, target audio, conditioning rows); entries may share a value.
             timestep_indices (`torch.Tensor` of shape `(seq_len,)`):
                 For every row of the packed sequence, the index of its timestep in `timestep`.
             token_tags (`torch.Tensor` of shape `(seq_len,)`):
@@ -635,9 +635,9 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin, PeftA
         hidden_states = hidden_states.index_copy(1, video_indices, video_embeds.to(text_embeds.dtype))
         hidden_states = hidden_states.index_copy(1, audio_indices, audio_embeds.to(text_embeds.dtype))
 
-        # 2. One timestep embedding per distinct noise level. `temb` is shared by all AdaLN projections, which are
-        # bfloat16 in the checkpoint while `time_embedder` is float32, so it stays at the time embedder's precision:
-        # each AdaLN module applies its own activation to it and casts to its projection's dtype afterwards.
+        # 2. One timestep embedding per table entry. `temb` is shared by all AdaLN projections, which are bfloat16 in
+        # the checkpoint while `time_embedder` is float32, so it stays at the time embedder's precision: each AdaLN
+        # module applies its own activation to it and casts to its projection's dtype afterwards.
         temb = self.time_proj(timestep)
         temb = self.time_embedder(temb.to(get_parameter_dtype(self.time_embedder)))
 

@@ -1168,8 +1168,8 @@ class MiniMaxH3SetTimestepsStep(ModularPipelineBlocks):
                 "row_timestep_plan",
                 type_hint=list,
                 description=(
-                    "One `(timestep, timestep_indices)` pair per step: the distinct timesteps of the sequence and the "
-                    "index of every row into them."
+                    "One `(timestep, timestep_indices)` pair per step: a fixed timestep table for the four row roles "
+                    "and the index of every row into it."
                 ),
             ),
         ]
@@ -1181,14 +1181,14 @@ class MiniMaxH3SetTimestepsStep(ModularPipelineBlocks):
         num_condition_video_rows: int,
         num_condition_audio_rows: int,
         num_text_tokens: int,
-        video_timestep: float,
-        audio_timestep: float,
-        condition_video_timestep: float,
-        condition_audio_timestep: float,
+        video_timestep: float | torch.Tensor,
+        audio_timestep: float | torch.Tensor,
+        condition_video_timestep: float | torch.Tensor,
+        condition_audio_timestep: float | torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         r"""
-        Assign a timestep to every row of the packed sequence and reduce it to the transformer's `(timestep,
-        timestep_indices)` pair.
+        Assign a timestep to every row of the packed sequence and build the transformer's `(timestep,
+        timestep_indices)` pair without converting device tensors to Python scalars.
 
         One forward serves rows at different noise levels: the generated video and audio rows step down their own
         schedules while the conditioning rows stay pinned at their noise-augmentation level. Text rows never reach an
@@ -1200,20 +1200,32 @@ class MiniMaxH3SetTimestepsStep(ModularPipelineBlocks):
             num_condition_video_rows (`int`): How many leading video rows are conditioning rows.
             num_condition_audio_rows (`int`): How many leading audio rows are reference rows.
             num_text_tokens (`int`): Number of text rows, which never reach an output head.
-            video_timestep (`float`): Timestep of the generated video rows.
-            audio_timestep (`float`): Timestep of the generated audio rows.
-            condition_video_timestep (`float`): Timestep of the video conditioning rows.
-            condition_audio_timestep (`float`): Timestep of the audio reference rows.
+            video_timestep (`float` or `torch.Tensor`): Timestep of the generated video rows.
+            audio_timestep (`float` or `torch.Tensor`): Timestep of the generated audio rows.
+            condition_video_timestep (`float` or `torch.Tensor`): Timestep of the video conditioning rows.
+            condition_audio_timestep (`float` or `torch.Tensor`): Timestep of the audio reference rows.
 
         Returns:
-            `tuple[torch.Tensor, torch.Tensor]`: the distinct timesteps, sorted, and the index of every row into them.
+            `tuple[torch.Tensor, torch.Tensor]`: the fixed four-role timestep table and the index of every row into it.
         """
         sequence_length = int(video_indices.numel() + audio_indices.numel() + num_text_tokens)
-        row_timesteps = torch.full((sequence_length,), video_timestep, dtype=torch.float32)
-        row_timesteps[video_indices[:num_condition_video_rows]] = condition_video_timestep
-        row_timesteps[audio_indices[num_condition_audio_rows:]] = audio_timestep
-        row_timesteps[audio_indices[:num_condition_audio_rows]] = condition_audio_timestep
-        return torch.unique(row_timesteps, sorted=True, return_inverse=True)
+        device = video_indices.device
+        timesteps = torch.stack(
+            [
+                torch.as_tensor(video_timestep, dtype=torch.float32, device=device),
+                torch.as_tensor(audio_timestep, dtype=torch.float32, device=device),
+                torch.as_tensor(condition_video_timestep, dtype=torch.float32, device=device),
+                torch.as_tensor(condition_audio_timestep, dtype=torch.float32, device=device),
+            ]
+        )
+
+        # The table has one stable slot per row role. The first video/audio step may share a value, but retaining both
+        # slots avoids dynamic-shape deduplication on the accelerator; every row still selects exactly its old value.
+        timestep_indices = torch.zeros(sequence_length, dtype=torch.long, device=device)
+        timestep_indices[video_indices[:num_condition_video_rows]] = 2
+        timestep_indices[audio_indices[num_condition_audio_rows:]] = 1
+        timestep_indices[audio_indices[:num_condition_audio_rows]] = 3
+        return timesteps, timestep_indices
 
     @torch.no_grad()
     def __call__(self, components: MiniMaxH3ModularPipeline, state: PipelineState) -> PipelineState:
@@ -1222,23 +1234,24 @@ class MiniMaxH3SetTimestepsStep(ModularPipelineBlocks):
 
         components.scheduler.set_timesteps(block_state.num_inference_steps, device=device)
         components.audio_scheduler.set_timesteps(block_state.num_inference_steps, device=device)
+        components.scheduler.set_begin_index(0)
+        components.audio_scheduler.set_begin_index(0)
         block_state.timesteps = components.scheduler.timesteps
         block_state.audio_timesteps = components.audio_scheduler.timesteps
 
+        condition_video_floor = block_state.timesteps.new_tensor(components.keyframe_noise_aug)
+        condition_audio_timestep = block_state.timesteps.new_tensor(1.0)
         block_state.row_timestep_plan = [
-            tuple(
-                tensor.to(device)
-                for tensor in self.build_row_timesteps(
-                    block_state.video_indices,
-                    block_state.audio_indices,
-                    block_state.num_condition_video_rows,
-                    block_state.num_condition_audio_rows,
-                    block_state.text_indices.numel(),
-                    float(timestep),
-                    float(audio_timestep),
-                    max(float(timestep), components.keyframe_noise_aug),
-                    1.0,
-                )
+            self.build_row_timesteps(
+                block_state.video_indices,
+                block_state.audio_indices,
+                block_state.num_condition_video_rows,
+                block_state.num_condition_audio_rows,
+                block_state.text_indices.numel(),
+                timestep,
+                audio_timestep,
+                torch.maximum(timestep, condition_video_floor),
+                condition_audio_timestep,
             )
             for timestep, audio_timestep in zip(block_state.timesteps, block_state.audio_timesteps)
         ]
